@@ -11,3 +11,5 @@ EXPORTS
     FreeLibrary@4
     ExitProcess@4
     GetTickCount64
+    AcquireSRWLockExclusive@4
+    ReleaseSRWLockExclusive@4

@@ -671,19 +671,24 @@ static const char* GN_VULKAN_DEVICE_EXTENSIONS = "";
 
 
 
-static volatile int gn_lock = 0;
+/* SRWLOCK is a pointer-sized, zero-initialized opaque value on Windows/Wine.
+ * Never hold the snapshot lock across transport I/O. Lock order is transaction
+ * then snapshot; cached readers acquire only the snapshot lock. */
+typedef struct { void* opaque; } gn_srwlock;
+GN_IMPORT void GN_STDCALL AcquireSRWLockExclusive(gn_srwlock* lock);
+GN_IMPORT void GN_STDCALL ReleaseSRWLockExclusive(gn_srwlock* lock);
+static gn_srwlock gn_transaction_lock = {0};
+static gn_srwlock gn_snapshot_lock = {0};
 
 static void gn_lock_acquire(void) {
-    while (__atomic_exchange_n(&gn_lock, 1, __ATOMIC_ACQUIRE) != 0) {
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#endif
-    }
+    AcquireSRWLockExclusive(&gn_transaction_lock);
 }
 
 static void gn_lock_release(void) {
-    __atomic_store_n(&gn_lock, 0, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&gn_transaction_lock);
 }
+
+static void gn_invalidate_snapshot(void);
 
 static int gn_load_unixlib(void) {
     if (gn_unix_handle) return 1;
@@ -1094,6 +1099,7 @@ static void gn_write_extension(XrExtensionProperties* property, const char* name
 
 
 static void gn_bridge_close(void) {
+    gn_invalidate_snapshot();
     if (gn_bridge_socket != GN_INVALID_SOCKET) {
         closesocket(gn_bridge_socket);
         gn_bridge_socket = GN_INVALID_SOCKET;
@@ -1271,9 +1277,26 @@ static int gn_bridge_call(const char* command, char* response, gn_size response_
     return ok;
 }
 
-static char gn_cached_views[1024];
-static char gn_cached_input[2][1024];
-static int gn_cache_valid = 0;
+struct gn_frame_snapshot {
+    char views[1024];
+    char input[2][1024];
+    int valid;
+};
+static struct gn_frame_snapshot gn_snapshot;
+
+/* Publish all three lines together; readers never observe a partial frame. */
+static void gn_publish_snapshot(const struct gn_frame_snapshot* snapshot) {
+    AcquireSRWLockExclusive(&gn_snapshot_lock);
+    gn_snapshot = *snapshot;
+    ReleaseSRWLockExclusive(&gn_snapshot_lock);
+}
+
+static void gn_invalidate_snapshot(void) {
+    AcquireSRWLockExclusive(&gn_snapshot_lock);
+    gn_snapshot.valid = 0;
+    ReleaseSRWLockExclusive(&gn_snapshot_lock);
+}
+
 static int gn_frame_sync_supported = 1;
 static int gn_split_line(const char** cursor, char* out, gn_size out_size) {
     const char* p = *cursor;
@@ -1291,8 +1314,10 @@ static int gn_split_line(const char** cursor, char* out, gn_size out_size) {
 
 static int gn_bridge_frame_sync(char* frame_out, gn_size frame_size) {
     int ok;
+    /* Transaction lock protects staging storage; avoid a large CRT-less stack frame. */
+    static struct gn_frame_snapshot next;
     gn_lock_acquire();
-    gn_cache_valid = 0;
+    gn_zero_memory(&next, sizeof(next));
     if (gn_unix_control_state >= 0) {
         char bundle[2048];
         if (gn_unix_control_transact("FRAME_SYNC", 4, bundle, sizeof(bundle))) {
@@ -1301,10 +1326,11 @@ static int gn_bridge_frame_sync(char* frame_out, gn_size frame_size) {
             if (gn_split_line(&cursor, first, sizeof(first)) &&
                 gn_starts_with(first, "OK")) {
                 gn_copy(frame_out, frame_size, first);
-                gn_cache_valid =
-                    gn_split_line(&cursor, gn_cached_views, sizeof(gn_cached_views)) &&
-                    gn_split_line(&cursor, gn_cached_input[0], sizeof(gn_cached_input[0])) &&
-                    gn_split_line(&cursor, gn_cached_input[1], sizeof(gn_cached_input[1]));
+                next.valid =
+                    gn_split_line(&cursor, next.views, sizeof(next.views)) &&
+                    gn_split_line(&cursor, next.input[0], sizeof(next.input[0])) &&
+                    gn_split_line(&cursor, next.input[1], sizeof(next.input[1]));
+                gn_publish_snapshot(&next);
                 gn_lock_release();
                 return 1;
             }
@@ -1313,33 +1339,35 @@ static int gn_bridge_frame_sync(char* frame_out, gn_size frame_size) {
                 gn_frame_sync_supported = 0;
                 gn_log_line("FRAME_SYNC unsupported by bridge; using separate per-frame requests");
             }
+            gn_invalidate_snapshot();
             gn_lock_release();
             return 0;
         }
     }
     ok = gn_bridge_call_locked("FRAME_SYNC", frame_out, frame_size);
     if (ok) {
-        gn_cache_valid =
-            gn_bridge_read_line_locked(gn_cached_views, sizeof(gn_cached_views)) &&
-            gn_bridge_read_line_locked(gn_cached_input[0], sizeof(gn_cached_input[0])) &&
-            gn_bridge_read_line_locked(gn_cached_input[1], sizeof(gn_cached_input[1]));
+        next.valid =
+            gn_bridge_read_line_locked(next.views, sizeof(next.views)) &&
+            gn_bridge_read_line_locked(next.input[0], sizeof(next.input[0])) &&
+            gn_bridge_read_line_locked(next.input[1], sizeof(next.input[1]));
     } else if (gn_starts_with(frame_out, "ERROR")) {
         gn_frame_sync_supported = 0;
         gn_log_line("FRAME_SYNC unsupported by bridge; using separate per-frame requests");
     }
+    gn_publish_snapshot(&next);
     gn_lock_release();
     return ok;
 }
 
 static int gn_cached_line(const char* which, int hand, char* out, gn_size out_size) {
     int ok = 0;
-    gn_lock_acquire();
-    if (gn_cache_valid) {
-        if (which[0] == 'v') gn_copy(out, out_size, gn_cached_views);
-        else gn_copy(out, out_size, gn_cached_input[hand]);
+    AcquireSRWLockExclusive(&gn_snapshot_lock);
+    if (gn_snapshot.valid) {
+        if (which[0] == 'v') gn_copy(out, out_size, gn_snapshot.views);
+        else gn_copy(out, out_size, gn_snapshot.input[hand]);
         ok = 1;
     }
-    gn_lock_release();
+    ReleaseSRWLockExclusive(&gn_snapshot_lock);
     return ok;
 }
 
@@ -1656,6 +1684,7 @@ static XrResult XRAPI_CALL gn_xrCreateInstance(const XrInstanceCreateInfo* creat
             gn_log2("  enabled extension: ", createInfo->enabledExtensionNames[i]);
         }
     }
+    gn_invalidate_snapshot();
     gn_bridge_call("HELLO", NULL, 0);
     *instance = gn_instance;
     return XR_SUCCESS;
@@ -1935,6 +1964,7 @@ static XrResult XRAPI_CALL gn_xrDestroySession(XrSession session) {
     }
     gn_swapchain_count = 0;
     gn_bridge_call("SWAPCHAIN_RESET", NULL, 0);
+    gn_invalidate_snapshot();
     if (gn_dxvk_interop) {
         gn_com_release(gn_dxvk_interop);
         gn_dxvk_interop = NULL;
