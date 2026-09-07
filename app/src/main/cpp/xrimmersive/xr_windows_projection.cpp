@@ -292,16 +292,17 @@ bool WindowsProjectionPresenter::importEyeBuffer(WindowsFrameTransport &transpor
     if (frame.kind == BufferKind::None) return false;
     fresh = frame.serial != renderedSerials_[eye];
     if (!waitForAcquireFence(frame.acquireFenceFd)) {
-        transport.discardFrame(static_cast<int>(eye), frame.imageIndex, frame.serial);
+        transport.discardFrame(static_cast<int>(eye), frame.imageIndex, frame.serial, frame.registrationSerial);
         if (fresh) renderedSerials_[eye] = frame.serial;
         return false;
     }
     frame.acquireFenceFd = -1;
     if (frame.imageIndex < 0 || frame.imageIndex >= WindowsFrameTransport::kMaxImages) {
-        transport.discardFrame(static_cast<int>(eye), frame.imageIndex, frame.serial);
+        transport.discardFrame(static_cast<int>(eye), frame.imageIndex, frame.serial, frame.registrationSerial);
         return false;
     }
     const int image = frame.imageIndex;
+    resourceOwners_[eye][image] = frame.registrationSerial;
     EGLImageKHR &cachedImage = eglImages_[eye][image];
     GLuint &cachedTexture = textures_[eye][image];
     uint64_t &registration = registrations_[eye][image];
@@ -337,7 +338,7 @@ bool WindowsProjectionPresenter::importEyeBuffer(WindowsFrameTransport &transpor
         }
     }
     if (imported == EGL_NO_IMAGE_KHR) {
-        transport.discardFrame(static_cast<int>(eye), image, frame.serial);
+        transport.discardFrame(static_cast<int>(eye), image, frame.serial, frame.registrationSerial);
         return false;
     }
     if (cachedTexture == 0) glGenTextures(1, &cachedTexture);
@@ -347,7 +348,7 @@ bool WindowsProjectionPresenter::importEyeBuffer(WindowsFrameTransport &transpor
     if (error != GL_NO_ERROR) {
         glBindTexture(GL_TEXTURE_2D, 0);
         eglDestroyImageKHR(display_, imported);
-        transport.discardFrame(static_cast<int>(eye), image, frame.serial);
+        transport.discardFrame(static_cast<int>(eye), image, frame.serial, frame.registrationSerial);
         return false;
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -385,7 +386,7 @@ void WindowsProjectionPresenter::discardFresh(WindowsFrameTransport &transport,
                                                const std::array<bool, 2> &fresh) {
     for (uint32_t eye = 0; eye < 2; ++eye) {
         if (!fresh[eye]) continue;
-        transport.discardFrame(static_cast<int>(eye), frames[eye].imageIndex, frames[eye].serial);
+        transport.discardFrame(static_cast<int>(eye), frames[eye].imageIndex, frames[eye].serial, frames[eye].registrationSerial);
         renderedSerials_[eye] = frames[eye].serial;
     }
 }
@@ -463,7 +464,7 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
     for (uint32_t eye = 0; eye < 2; ++eye) {
         if (!fresh[eye]) continue;
         transport.publishReleaseFence(static_cast<int>(eye), frames[eye].imageIndex,
-                                      releaseFences[eye]);
+                                      frames[eye].registrationSerial, releaseFences[eye]);
         renderedSerials_[eye] = frames[eye].serial;
     }
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -473,6 +474,40 @@ bool WindowsProjectionPresenter::render(WindowsFrameTransport &transport, XrSpac
     layer->viewCount = 2;
     layer->views = views_.data();
     return true;
+}
+
+void WindowsProjectionPresenter::collectRetired(WindowsFrameTransport &transport) {
+    auto retired = transport.takeRetired();
+    if (retired.empty()) return;
+    // Lifecycle-only drain: never introduce a queue drain on ordinary frames.
+    // Also covers repeated draws performed after a producer release fence.
+    glFinish();
+    for (const auto& entry : retired) {
+        const auto eye = entry.eye;
+        const auto image = entry.frame.imageIndex;
+        const auto serial = entry.frame.registrationSerial;
+        if (resourceOwners_[eye][image] == serial) {
+            if (eglImages_[eye][image] != EGL_NO_IMAGE_KHR)
+                eglDestroyImageKHR(display_, eglImages_[eye][image]);
+            eglImages_[eye][image] = EGL_NO_IMAGE_KHR;
+            if (textures_[eye][image]) glDeleteTextures(1, &textures_[eye][image]);
+            textures_[eye][image] = 0;
+            registrations_[eye][image] = 0;
+            resourceOwners_[eye][image] = 0;
+            cpuFallback_[eye][image] = false;
+            cpuTextureWidths_[eye][image] = 0;
+            cpuTextureHeights_[eye][image] = 0;
+        }
+        // A failed import can leave a mapping without a successful texture registration.
+        if (cpuMappingRegistrations_[eye][image] == serial) {
+            if (cpuMappings_[eye][image])
+                munmap(cpuMappings_[eye][image], cpuMappingLengths_[eye][image]);
+            cpuMappings_[eye][image] = nullptr;
+            cpuMappingLengths_[eye][image] = 0;
+            cpuMappingRegistrations_[eye][image] = 0;
+        }
+        transport.finishRetirement(entry);
+    }
 }
 
 void WindowsProjectionPresenter::shutdown() {

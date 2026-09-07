@@ -37,3 +37,12 @@ if ($LASTEXITCODE -ne 0) { throw "Wine unixlib configuration failed" }
 & $cmake --build $unixBuild --config $Configuration
 if ($LASTEXITCODE -ne 0) { throw "Wine unixlib build failed" }
 Copy-Item -Force -LiteralPath (Join-Path $unixBuild "gamenative_xr_unixbridge.so") -Destination (Join-Path $payloadOutput "gamenative_xr_unixbridge.so")
+
+# Both Quest flavors ship the same native runtime and transport.
+$legacyNative = Join-Path $repository "app\src\legacyXr\jniLibs\arm64-v8a"
+$legacyAssets = Join-Path $repository "app\src\legacyXr\assets"
+New-Item -ItemType Directory -Force -Path $legacyNative, $legacyAssets | Out-Null
+Copy-Item -Force -LiteralPath (Join-Path $output "libxrimmersive.so") -Destination (Join-Path $legacyNative "libxrimmersive.so")
+Copy-Item -Force -LiteralPath (Join-Path $payloadOutput "gamenative_xr_unixbridge.so") -Destination (Join-Path $legacyAssets "gamenative_xr_unixbridge.so")
+& (Join-Path $PSScriptRoot "verify-xr-payload.ps1")
+Copy-Item -Force -LiteralPath (Join-Path $payloadOutput "payload.version") -Destination (Join-Path $legacyAssets "payload.version")

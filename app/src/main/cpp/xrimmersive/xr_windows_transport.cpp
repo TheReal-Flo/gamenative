@@ -176,7 +176,11 @@ WindowsFrameTransport::WindowsFrameTransport() {
     }
 }
 
-WindowsFrameTransport::~WindowsFrameTransport() { stop(); }
+WindowsFrameTransport::~WindowsFrameTransport() {
+    stop();
+    for (const auto& retired : takeRetired()) finishRetirement(retired);
+    for (int eye = 0; eye < kEyeCount; ++eye) dropRetainedLocked(eye);
+}
 
 void WindowsFrameTransport::start(const std::string& socketPath) {
     bool expected = false;
@@ -198,8 +202,7 @@ void WindowsFrameTransport::stop() {
     }
     if (acceptThread_.joinable()) acceptThread_.join();
     for (int eye = 0; eye < kEyeCount; ++eye) releaseEye(eye);
-    std::lock_guard<std::mutex> lock(eyesMutex_);
-    for (int eye = 0; eye < kEyeCount; ++eye) dropRetainedLocked(eye);
+
 }
 
 void WindowsFrameTransport::acceptLoop() {
@@ -242,7 +245,7 @@ void WindowsFrameTransport::acceptLoop() {
         int expectedClient = clientFd;
         clientFd_.compare_exchange_strong(expectedClient, -1);
         ::close(clientFd);
-        for (int eye = 0; eye < kEyeCount; ++eye) resetEye(eye);
+        for (int eye = 0; eye < kEyeCount; ++eye) releaseEye(eye);
         LOGI("xr transport: producer disconnected");
     }
 
@@ -270,6 +273,8 @@ void WindowsFrameTransport::serviceClient(int clientFd) {
             if (!handleFrameLine(clientFd, line)) return;
         } else if (line.rfind("ACQUIRE", 0) == 0) {
             if (!handleAcquireLine(clientFd, line)) return;
+        } else if (line.rfind("UNREGISTER ", 0) == 0) {
+            if (!handleUnregisterLine(clientFd, line)) return;
         } else if (line.rfind("BYE", 0) == 0) {
             replyOk(clientFd);
             return;
@@ -492,14 +497,8 @@ bool WindowsFrameTransport::handleAcquireLine(int clientFd, const std::string& l
 
 void WindowsFrameTransport::releaseSlotLocked(int eye, int imageIndex) {
     EyeFrame& slot = buffers_[eye][imageIndex];
-    if (slot.kind == BufferKind::HardwareBuffer && slot.buffer != nullptr) {
-        AHardwareBuffer_release(slot.buffer);
-    } else if (slot.kind == BufferKind::DmaBuf) {
-        for (int plane = 0; plane < slot.planeCount; ++plane) {
-            if (slot.dmabufFds[plane] >= 0) ::close(slot.dmabufFds[plane]);
-        }
-    }
-    if (slot.acquireFenceFd >= 0) ::close(slot.acquireFenceFd);
+    // Move ownership to retirement; the GL thread releases it after GPU completion.
+    if (slot.kind != BufferKind::None) retired_.push_back({eye, slot});
     slot = EyeFrame{};
     if (releaseFenceFds_[eye][imageIndex] >= 0) {
         ::close(releaseFenceFds_[eye][imageIndex]);
@@ -557,21 +556,47 @@ void WindowsFrameTransport::releaseEye(int eye) {
     releaseCv_.notify_all();
 }
 
-void WindowsFrameTransport::resetEye(int eye) {
-    std::lock_guard<std::mutex> lock(eyesMutex_);
-    if (latest_[eye].acquireFenceFd >= 0) {
-        ::close(latest_[eye].acquireFenceFd);
-    }
-    latest_[eye] = EyeFrame{};
-    latestClaimed_[eye] = false;
-    for (int image = 0; image < kMaxImages; ++image) {
-        if (releaseFenceFds_[eye][image] >= 0) {
-            ::close(releaseFenceFds_[eye][image]);
-            releaseFenceFds_[eye][image] = -1;
+bool WindowsFrameTransport::handleUnregisterLine(int clientFd, const std::string& line) {
+    const auto first = parseKey(line, "first", -1);
+    const auto count = parseKey(line, "count", -1);
+    if (first < 0 || first >= kMaxImages || count <= 0 || count > kMaxImages - first)
+        return writeAll(clientFd, "ERR unregister\n", 15);
+    {
+        std::lock_guard<std::mutex> lock(eyesMutex_);
+        for (int eye = 0; eye < kEyeCount; ++eye) {
+            if (latest_[eye].kind != BufferKind::None &&
+                latest_[eye].imageIndex >= first && latest_[eye].imageIndex < first + count) {
+                if (latest_[eye].acquireFenceFd >= 0) ::close(latest_[eye].acquireFenceFd);
+                latest_[eye] = EyeFrame{};
+                latestClaimed_[eye] = false;
+            }
+            for (int index = first; index < first + count; ++index)
+                releaseSlotLocked(eye, index);
         }
-        releasePending_[eye][image] = false;
     }
     releaseCv_.notify_all();
+    return replyOk(clientFd);
+}
+
+std::vector<WindowsFrameTransport::RetiredBuffer> WindowsFrameTransport::takeRetired() {
+    std::lock_guard<std::mutex> lock(eyesMutex_);
+    std::vector<RetiredBuffer> result;
+    result.swap(retired_);
+    return result;
+}
+
+void WindowsFrameTransport::finishRetirement(const RetiredBuffer& retired) {
+    // Called only by the GL owner after its outstanding reads have finished.
+    std::lock_guard<std::mutex> lock(eyesMutex_);
+    if (retained_[retired.eye].registrationSerial == retired.frame.registrationSerial)
+        dropRetainedLocked(retired.eye);
+    const auto& frame = retired.frame;
+    if (frame.kind == BufferKind::HardwareBuffer && frame.buffer)
+        AHardwareBuffer_release(frame.buffer);
+    if (frame.kind == BufferKind::DmaBuf)
+        for (int plane = 0; plane < frame.planeCount; ++plane)
+            if (frame.dmabufFds[plane] >= 0) ::close(frame.dmabufFds[plane]);
+    if (frame.acquireFenceFd >= 0) ::close(frame.acquireFenceFd);
 }
 
 void WindowsFrameTransport::dropRetainedLocked(int eye) {
@@ -607,7 +632,7 @@ EyeFrame WindowsFrameTransport::pollEye(int eye) {
     return snapshot;
 }
 
-void WindowsFrameTransport::publishReleaseFence(int eye, int imageIndex, int releaseFenceFd) {
+void WindowsFrameTransport::publishReleaseFence(int eye, int imageIndex, uint64_t registration, int releaseFenceFd) {
     if (eye < 0 || eye >= kEyeCount ||
         imageIndex < 0 || imageIndex >= kMaxImages) {
         if (releaseFenceFd >= 0) ::close(releaseFenceFd);
@@ -615,6 +640,10 @@ void WindowsFrameTransport::publishReleaseFence(int eye, int imageIndex, int rel
     }
     {
         std::lock_guard<std::mutex> lock(eyesMutex_);
+        if (buffers_[eye][imageIndex].registrationSerial != registration) {
+            if (releaseFenceFd >= 0) ::close(releaseFenceFd);
+            return;
+        }
         if (releaseFenceFds_[eye][imageIndex] >= 0) {
             ::close(releaseFenceFds_[eye][imageIndex]);
         }
@@ -624,11 +653,12 @@ void WindowsFrameTransport::publishReleaseFence(int eye, int imageIndex, int rel
     releaseCv_.notify_all();
 }
 
-void WindowsFrameTransport::discardFrame(int eye, int imageIndex, uint64_t serial) {
+void WindowsFrameTransport::discardFrame(int eye, int imageIndex, uint64_t serial, uint64_t registration) {
     if (eye < 0 || eye >= kEyeCount ||
         imageIndex < 0 || imageIndex >= kMaxImages) return;
     {
         std::lock_guard<std::mutex> lock(eyesMutex_);
+        if (buffers_[eye][imageIndex].registrationSerial != registration) return;
         if (latest_[eye].serial == serial &&
             latest_[eye].imageIndex == imageIndex) {
             if (latest_[eye].acquireFenceFd >= 0)

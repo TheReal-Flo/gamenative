@@ -63,6 +63,7 @@ struct gn_image {
     uint32_t strides[4];
     uint32_t offsets[4];
     uint64_t modifier;
+    uint64_t registration_connection;
     uint8_t registered_eye_mask;
     uint32_t registered_array_index[2];
     uint8_t transport_kind[2];
@@ -98,6 +99,7 @@ static uint32_t queue_family_index;
 static VkCommandPool command_pool;
 static void *vulkan_so;
 static int transport_fd = -1;
+static uint64_t transport_connection; /* Protected by socket_mutex. */
 static uint8_t transport_frame_announced[2];
 static uint64_t transport_frame_id;
 
@@ -410,6 +412,7 @@ static int ensure_transport(void)
         return 0;
     }
     transport_fd = fd;
+    ++transport_connection;
     return 1;
 }
 
@@ -1805,6 +1808,14 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
     struct gn_swapchain *swapchain = &swapchains[slot];
     struct gn_image *image = &swapchain->images[image_index];
     const uint8_t bit = (uint8_t)(1u << eye);
+    if (!ensure_transport()) return 0;
+    // Reset lazily, under socket_mutex, without touching other live swapchains.
+    if (image->registration_connection != transport_connection) {
+        image->registered_eye_mask = 0;
+        for (uint32_t hand = 0; hand < 2; ++hand)
+            image->transport[hand].registered = 0;
+        image->registration_connection = transport_connection;
+    }
     if (array_index >= swapchain->array_size) return 0;
     if ((image->registered_eye_mask & bit) &&
         image->registered_array_index[eye] == array_index) return 1;
@@ -1829,6 +1840,12 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
         image->transport_kind[eye] = GN_TRANSPORT_DMABUF;
     }
     if (image->transport_kind[eye] == GN_TRANSPORT_RELAY) {
+#if defined(__ANDROID__)
+        if (!relay_register(slot, image_index, eye)) return 0;
+#else
+        return 0;
+#endif
+        image->registered_eye_mask |= bit;
         if (image->registered_array_index[eye] != array_index) {
             image->transport[eye].steady_recorded = 0;
         }
@@ -1836,6 +1853,8 @@ static int register_image(uint32_t slot, uint32_t image_index, uint32_t eye,
         return 1;
     }
     if (image->transport_kind[eye] == GN_TRANSPORT_AHARDWAREBUFFER) {
+        if (!register_ahardwarebuffer(slot, image_index, eye)) return 0;
+        image->registered_eye_mask |= bit;
         if (image->registered_array_index[eye] != array_index) {
             image->transport[eye].steady_recorded = 0;
         }
@@ -2124,6 +2143,21 @@ static int32_t unix_destroy_swapchain(void *opaque)
     submit_worker_flush();
     pthread_mutex_lock(&state_mutex);
     struct gn_swapchain *swapchain = &swapchains[args->slot];
+    /* Same socket/order as registration and FRAME, after the submit worker drains.
+     * Android snapshots the registration serials before acknowledging retirement.
+     * Keep its shared backing references until GL finishes; do not reconnect merely
+     * to unregister a swapchain that was never sent on this connection. */
+    pthread_mutex_lock(&socket_mutex);
+    if (transport_fd >= 0) {
+        char line[96], response[64];
+        snprintf(line, sizeof(line), "UNREGISTER first=%u count=%u\n",
+                 args->slot * GN_UNIX_MAX_IMAGES, GN_UNIX_MAX_IMAGES);
+        if (!transact_line(line, response, sizeof(response)) || strncmp(response, "OK", 2)) {
+            log_line("swapchain unregister failed; disconnecting transport");
+            close_transport();
+        }
+    }
+    pthread_mutex_unlock(&socket_mutex);
     for (uint32_t i = 0; i < swapchain->image_count; ++i)
         destroy_image(&swapchain->images[i]);
     memset(swapchain, 0, sizeof(*swapchain));
@@ -2156,8 +2190,14 @@ static int32_t unix_acquire_image(void *opaque)
         timeout_ms = -1;
     else
         timeout_ms = (int)((args->timeout_ns + 999999) / 1000000);
+    if (!ensure_transport()) {
+        args->result = GN_UNIX_ERROR_UNAVAILABLE;
+        pthread_mutex_unlock(&socket_mutex);
+        return 0;
+    }
     for (uint32_t eye = 0; eye < 2; ++eye) {
-        if (!(image->registered_eye_mask & (1u << eye))) continue;
+        if (image->registration_connection != transport_connection ||
+            !(image->registered_eye_mask & (1u << eye))) continue;
         const uint32_t transport_index =
             args->slot * GN_UNIX_MAX_IMAGES + args->image_index;
         snprintf(line, sizeof(line), "ACQUIRE eye=%u index=%u timeout=%d\n",
@@ -2392,6 +2432,10 @@ static int submit_views_transport(
     }
 
     pthread_mutex_lock(&socket_mutex);
+    if (!ensure_transport()) {
+        pthread_mutex_unlock(&socket_mutex);
+        return 0;
+    }
     VkCommandBuffer commands[2];
     struct gn_transport_image *recorded[2];
     uint32_t command_count = 0;

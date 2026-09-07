@@ -232,6 +232,7 @@ void XrImmersiveSession::runLoop() {
 
     while (!stopRequested_.load()) {
         pollXrEvents();
+        if (windowsProjectionReady_) windowsProjection_.collectRetired(windowsTransport_);
 
         if (!sessionRunning_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1549,6 +1550,7 @@ void XrImmersiveSession::teardown() {
     stereoActive_.store(false);
     stereoMisses_ = 0;
     windowsTransport_.stop();
+    if (windowsProjectionReady_) windowsProjection_.collectRetired(windowsTransport_);
     windowsProjection_.shutdown();
     teardownPassthrough();
     if (gameTexture_ != 0) {

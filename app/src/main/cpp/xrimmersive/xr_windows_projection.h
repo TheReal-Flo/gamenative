@@ -20,6 +20,7 @@ public:
     bool initialize(XrSession session, int64_t format, uint32_t width, uint32_t height, EGLDisplay display);
     bool render(WindowsFrameTransport &transport, XrSpace space, XrCompositionLayerProjection *layer);
     void shutdown();
+    void collectRetired(WindowsFrameTransport &transport);
 
 private:
     bool ensureProgram();
@@ -44,6 +45,8 @@ private:
     std::array<std::array<EGLImageKHR, WindowsFrameTransport::kMaxImages>, 2> eglImages_{};
     std::array<std::array<GLuint, WindowsFrameTransport::kMaxImages>, 2> textures_{};
     std::array<std::array<uint64_t, WindowsFrameTransport::kMaxImages>, 2> registrations_{};
+    // Ownership includes failed imports, whose successful registration remains unset.
+    std::array<std::array<uint64_t, WindowsFrameTransport::kMaxImages>, 2> resourceOwners_{};
     std::array<std::array<bool, WindowsFrameTransport::kMaxImages>, 2> cpuFallback_{};
     std::array<std::array<void *, WindowsFrameTransport::kMaxImages>, 2> cpuMappings_{};
     std::array<std::array<size_t, WindowsFrameTransport::kMaxImages>, 2> cpuMappingLengths_{};

@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace xrimmersive::windowsvr {
 
@@ -82,9 +83,13 @@ public:
 
     EyeFrame pollEye(int eye);
 
-    void publishReleaseFence(int eye, int imageIndex, int releaseFenceFd);
+    struct RetiredBuffer { int eye; EyeFrame frame; };
+    // GL owner drains these after completing outstanding reads.
+    std::vector<RetiredBuffer> takeRetired();
+    void finishRetirement(const RetiredBuffer& retired);
+    void publishReleaseFence(int eye, int imageIndex, uint64_t registration, int releaseFenceFd);
 
-    void discardFrame(int eye, int imageIndex, uint64_t serial);
+    void discardFrame(int eye, int imageIndex, uint64_t serial, uint64_t registration);
 
     bool hasStereoContent() const;
 
@@ -100,7 +105,7 @@ private:
     void storeEyeDmabuf(int eye, const EyeFrame& incoming);
     void releaseSlotLocked(int eye, int imageIndex);
     void releaseEye(int eye);
-    void resetEye(int eye);
+    bool handleUnregisterLine(int clientFd, const std::string& line);
     void dropRetainedLocked(int eye);
 
     std::string socketPath_;
@@ -118,6 +123,7 @@ private:
     int releaseFenceFds_[kEyeCount][kMaxImages];
     bool releasePending_[kEyeCount][kMaxImages]{};
     uint64_t nextSerial_{1};
+    std::vector<RetiredBuffer> retired_;
 };
 
 }
